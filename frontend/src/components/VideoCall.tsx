@@ -1,110 +1,155 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import io from "socket.io-client";
-import Peer from "peerjs";
+import { useEffect, useState, useRef } from "react";
+import { io, Socket } from "socket.io-client";
+import SimplePeer from "simple-peer";
 
-export default function VideoCall() {
-  const [myId, setMyId] = useState<string | null>(null);
-  const [remoteId, setRemoteId] = useState<string | null>(null);
-  const myVideoRef = useRef<HTMLVideoElement>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const peerInstance = useRef<Peer | null>(null);
-  const socket = useRef<any>(null);
-  const [hasMounted, setHasMounted] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+const socket: Socket = io("http://localhost:5000");
+
+export default function Chat() {
+  const [roomId, setRoomId] = useState("");
+  const [userId] = useState(() => Math.random().toString(36).substring(2, 7));
+  const [messages, setMessages] = useState<{ userId: string; msg: string }[]>(
+    []
+  );
+  const [msg, setMsg] = useState("");
+  const [participants, setParticipants] = useState<
+    { userId: string; socketId: string }[]
+  >([]);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [peers, setPeers] = useState<{
+    [socketId: string]: SimplePeer.Instance;
+  }>({});
+  const myVideo = useRef<HTMLVideoElement>(null);
+  const userVideos = useRef<{ [key: string]: HTMLVideoElement | null }>({});
 
   useEffect(() => {
-    // Garante que o código só execute no cliente
-    setHasMounted(true);
-    if (typeof window === "undefined") return;
-
-    // Inicializa o socket apenas no cliente
-    socket.current = io("http://localhost:5000", { autoConnect: false });
-
-    const peer = new Peer();
-    peerInstance.current = peer;
-
-    peer.on("open", (id) => {
-      setMyId(id);
-      socket.current.connect();
-      socket.current.emit("join-room", "room-1", id);
+    socket.on("receive-message", ({ userId, msg }) => {
+      setMessages((prev) => [...prev, { userId, msg }]);
     });
 
-    peer.on("error", (err) => console.error("Erro PeerJS:", err));
+    socket.on("user-joined", ({ userId, socketId }) => {
+      setParticipants((prev) => [...prev, { userId, socketId }]);
+    });
 
-    // 🚀 Tenta acessar a câmera e microfone
-    async function requestMedia() {
-      try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error("API de mídia não suportada neste navegador.");
-        }
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-
-        if (myVideoRef.current) {
-          myVideoRef.current.srcObject = stream;
-        }
-
-        peer.on("call", (call) => {
-          call.answer(stream);
-          call.on("stream", (remoteStream) => {
-            if (remoteVideoRef.current && !remoteVideoRef.current.srcObject) {
-              remoteVideoRef.current.srcObject = remoteStream;
-            }
-          });
-        });
-
-        socket.current.on("user-connected", (userId: string) => {
-          setRemoteId(userId);
-          const call = peer.call(userId, stream);
-          call.on("stream", (remoteStream) => {
-            if (remoteVideoRef.current && !remoteVideoRef.current.srcObject) {
-              remoteVideoRef.current.srcObject = remoteStream;
-            }
-          });
-        });
-      } catch (err: any) {
-        setError("Erro ao acessar câmera/microfone: " + err.message);
-        console.error("Erro ao acessar câmera/microfone:", err);
+    socket.on("peer-signal", ({ signal, from }) => {
+      if (peers[from]) {
+        peers[from].signal(signal);
       }
-    }
+    });
 
-    requestMedia();
+    socket.on("user-left", ({ userId }) => {
+      setParticipants((prev) => prev.filter((p) => p.userId !== userId));
+    });
 
     return () => {
-      peer.disconnect();
-      socket.current.disconnect();
+      socket.off("receive-message");
+      socket.off("user-joined");
+      socket.off("peer-signal");
+      socket.off("user-left");
     };
-  }, []);
+  }, [peers]);
 
-  // 🔴 Evita erro de Hydration Mismatch
-  if (!hasMounted) return null;
+  const joinRoom = () => {
+    if (roomId) {
+      socket.emit("join-room", { roomId, userId });
+    }
+  };
+
+  const sendMessage = () => {
+    if (msg.trim()) {
+      socket.emit("send-message", { msg });
+      setMessages((prev) => [...prev, { userId: "Você", msg }]);
+      setMsg("");
+    }
+  };
+
+  const startCall = async () => {
+    const userStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
+    });
+    setStream(userStream);
+    if (myVideo.current) myVideo.current.srcObject = userStream;
+
+    const newPeers: { [key: string]: SimplePeer.Instance } = {};
+
+    participants.forEach(({ socketId }) => {
+      const peer = new SimplePeer({
+        initiator: true,
+        trickle: false,
+        stream: userStream,
+      });
+
+      peer.on("signal", (signal) => {
+        socket.emit("send-signal", { signal, to: socketId });
+      });
+
+      peer.on("stream", (userStream) => {
+        if (userVideos.current[socketId]) {
+          userVideos.current[socketId]!.srcObject = userStream;
+        }
+      });
+
+      newPeers[socketId] = peer;
+    });
+
+    setPeers(newPeers);
+  };
 
   return (
-    <div className="flex flex-col items-center space-y-4">
-      <h1 className="text-2xl font-bold">Video Chamada</h1>
+    <div className="flex flex-col items-center p-6 bg-gray-900 text-white h-screen">
+      <h1 className="text-2xl mb-4">Chat e Videochamada</h1>
 
-      {error && <p className="text-red-500">{error}</p>}
-
-      <video
-        ref={myVideoRef}
-        autoPlay
-        playsInline
-        muted // 🔴 Necessário para autoplay sem permissão manual
-        className="w-1/2 border"
+      <input
+        type="text"
+        placeholder="Código da Sala"
+        className="p-2 text-black rounded mb-2"
+        value={roomId}
+        onChange={(e) => setRoomId(e.target.value)}
       />
-      <video
-        ref={remoteVideoRef}
-        autoPlay
-        playsInline
-        className="w-1/2 border"
-      />
+      <button className="p-2 bg-green-600 rounded mb-4" onClick={joinRoom}>
+        Entrar na Sala
+      </button>
 
-      <p>ID da Chamada: {myId || "Carregando..."}</p>
+      <div className="w-full max-w-md">
+        <div className="h-60 overflow-y-auto border border-gray-400 rounded p-2 mb-2">
+          {messages.map((m, index) => (
+            <p key={index} className="mb-1">
+              <strong>{m.userId}:</strong> {m.msg}
+            </p>
+          ))}
+        </div>
+
+        <input
+          type="text"
+          placeholder="Digite sua mensagem..."
+          className="p-2 text-black w-full rounded mb-2"
+          value={msg}
+          onChange={(e) => setMsg(e.target.value)}
+        />
+        <button
+          className="p-2 bg-blue-600 rounded w-full"
+          onClick={sendMessage}
+        >
+          Enviar
+        </button>
+      </div>
+
+      <div className="mt-4 flex gap-4">
+        <video ref={myVideo} autoPlay muted className="w-32 h-32 border" />
+        {participants.map(({ socketId }) => (
+          <video
+            key={socketId}
+            ref={(el) => (userVideos.current[socketId] = el)}
+            autoPlay
+            className="w-32 h-32 border"
+          />
+        ))}
+      </div>
+      <button className="p-2 bg-red-600 rounded mt-4" onClick={startCall}>
+        Iniciar Chamada
+      </button>
     </div>
   );
 }
